@@ -16,6 +16,11 @@ To clean up duplicates *within* a file (the same work under different keys):
 
 `--self` and `--from` can be combined: the file is deduplicated first, then the merge happens.
 
+> [!CAUTION]
+> This whole thing was AI-generated without a single look at the code. 
+> I use it on git-tracked files so I can review all the resulting changes to the bibtex. 
+> It has worked well for me so far, but I can't guarantee the same for you. 
+
 ## What it does
 
 Every entry of `other.bib` is compared against `references.bib` (and against the entries added so far, so duplicates *within* `other.bib` are caught as well):
