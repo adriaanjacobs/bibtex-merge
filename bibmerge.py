@@ -10,6 +10,11 @@ if their key differs it is recorded as an alias (biblatex `ids` field) so
 \\cite{other-key} keeps working. When it is unclear, you are asked. Everything
 else is appended to references.bib, copied verbatim. other.bib is only read.
 
+    python3 bibmerge.py --into references.bib --self
+
+does the same for references.bib against itself: every entry is compared with
+the ones above it, and duplicates are folded into the first one.
+
 references.bib is edited as text: entries are only touched when they gain an
 alias, a new key or are replaced by the input version, everything else
 (formatting, comments, order) stays as is.
@@ -195,10 +200,11 @@ class StringDef:
 
 
 class Entry:
-    def __init__(self, raw, origin, path, span=None, prefix=''):
+    def __init__(self, raw, origin, path, line, span=None, prefix=''):
         self.raw = raw
         self.origin = origin          # 'target' (the --into file) or 'input' (a --from file)
         self.path = path
+        self.line = line
         self.span = span              # where it sits in its source file
         self.prefix = prefix          # comment lines just above it, kept with it
         self.modified = False
@@ -301,6 +307,7 @@ def parse_bib(text, origin, path):
     """Return (entries, @string definitions) found in text."""
     entries, strings = [], []
     i = 0
+    line, counted = 1, 0
     while True:
         at = text.find('@', i)
         if at == -1:
@@ -310,6 +317,8 @@ def parse_bib(text, origin, path):
             i = at + 1
             continue
         kind = m.group(1).lower()
+        line += text.count('\n', counted, at)
+        counted = at
         try:
             open_idx = m.end() - 1
             end = match_brace(text, open_idx) if text[open_idx] == '{' else match_paren(text, open_idx)
@@ -317,9 +326,8 @@ def parse_bib(text, origin, path):
             if kind == 'string':
                 strings.append(StringDef(raw, (at, end)))
             elif kind not in ('comment', 'preamble'):
-                entries.append(Entry(raw, origin, path, (at, end), preceding_comments(text, at)))
+                entries.append(Entry(raw, origin, path, line, (at, end), preceding_comments(text, at)))
         except BibSyntaxError as e:
-            line = text.count('\n', 0, at) + 1
             sys.exit(f'{path}:{line}: {e}')
         i = end
 
@@ -404,6 +412,19 @@ def find_doi(entry, strings):
     return None
 
 
+URL_RE = re.compile(r'https?://\S+?(?=[}\s]|$)')
+
+
+def find_url(entry, strings):
+    """The first URL in url/howpublished/note, normalized, or None."""
+    for name in ('url', 'howpublished', 'note'):
+        m = URL_RE.search(entry.get(name, strings) or '')
+        if m:
+            url = re.sub(r'^https?://(www\.)?', '', m.group().lower())
+            return url.rstrip('/')
+    return None
+
+
 class Info:
     """What we compare entries on, extracted once per entry."""
 
@@ -418,6 +439,10 @@ class Info:
         self.year = m.group() if m else None
         self.year_raw = year.strip()
         self.doi = find_doi(entry, strings)
+        self.url = find_url(entry, strings)
+        # 'CWE-125' vs 'CWE-787', 'SPEC CPU2006' vs 'SPEC CPU2017': numbers in a
+        # title tend to tell apart works that are otherwise named alike
+        self.numbers = sorted(w for w in self.title.split() if any(c.isdigit() for c in w))
         self.venue = next((' '.join(v.split()) for v in
                            (entry.get(f, strings) for f in VENUE_FIELDS) if v), None)
 
@@ -451,6 +476,9 @@ def compare(entry, other):
     same_authors = authors is not None and authors >= AUTHORS_SAME
     year_ok = not a.year or not b.year or a.year == b.year
     doi_conflict = bool(a.doi and b.doi and a.doi != b.doi)
+    url_conflict = bool(a.url and b.url and a.url != b.url)
+    if a.numbers and b.numbers and a.numbers != b.numbers:
+        return None
 
     reasons = [f'title {sim:.0%} similar']
     if authors is not None:
@@ -459,6 +487,8 @@ def compare(entry, other):
         reasons.append('same year' if a.year == b.year else 'different year')
     if doi_conflict:
         reasons.append('different DOI')
+    if url_conflict:
+        reasons.append('different URL')
     if same_key:
         reasons.append('same key')
     score = sim + 0.3 * (authors or 0) + 0.1 * year_ok + 0.2 * bool(same_key)
@@ -467,9 +497,11 @@ def compare(entry, other):
         return Match(other, True, 2.0 + score, reasons)
 
     short = min(len(a.title), len(b.title)) < SHORT_TITLE
+    # different URLs: only trust a really similar title, not just shared authors
+    loose = same_authors and not url_conflict
     if (sim >= (TITLE_MAYBE_SHORT if short else TITLE_MAYBE)
-            or (same_authors and year_ok and sim >= TITLE_MAYBE_SAME_AUTHORS)
-            or (same_authors and a.title and b.title
+            or (loose and year_ok and sim >= TITLE_MAYBE_SAME_AUTHORS)
+            or (loose and a.title and b.title
                 and (a.title.startswith(b.title) or b.title.startswith(a.title)))
             # same key but nothing else in common is a key conflict, handled when adding
             or (same_key and (sim >= 0.5 or same_authors))):
@@ -500,9 +532,9 @@ def describe(entry, label, into):
     i = entry.info
     alias = f'  {dim("aliases: " + ", ".join(entry.aliases))}' if entry.aliases else ''
     if label == 'existing' and entry.origin == 'input':
-        where = f'in {into}, added from {entry.path} during this run'
+        where = f'in {into}, added from {entry.path}:{entry.line} during this run'
     else:
-        where = f'in {entry.path}'
+        where = f'{entry.path}:{entry.line}'
     lines = [f'  {bold(f"{label:<10}")} @{entry.type}{{{bold(entry.key)}}}{alias}  {dim("(" + where + ")")}',
              f'             {i.title_raw or "(no title)"}',
              f'             {short_authors(i)}',
@@ -513,7 +545,8 @@ def describe(entry, label, into):
 
 
 class Duplicate:
-    def __init__(self, input_key, target, how, aliases, renamed_from, replaced):
+    def __init__(self, input_key, target, how, aliases, renamed_from, replaced, own):
+        self.own = own                    # --self: a duplicate within the --into file
         self.input_key = input_key
         self.target = target
         self.key = target.key             # as it was right after this decision
@@ -530,16 +563,29 @@ class Merger:
         self.target_strings = {s.name: s for s in target_strings}
         self.input_strings = {s.name: s for s in input_strings}
         self.new_strings = {}
-        self.index = {}          # lowercased key or alias -> entry
+        self.index = {}          # lowercased key or alias -> entry, of the entries in self.entries
+        # Every key in the --into file, including entries --self hasn't looked at
+        # yet, so we never hand out a key that is used further down.
+        self.reserved = {}
         for e in self.entries:
             for k in e.keys:
-                self.index.setdefault(k.lower(), e)
+                self.reserved.setdefault(k.lower(), e)
+        self.entries = []
         self.interactive = args.interactive
         self.added = []
+        self.removed = []        # --self: entries of the --into file folded into an earlier one
         self.duplicates = []     # [Duplicate]
-        self.skipped = []        # (input entry, reason)
-        self.renamed = []        # (old, new) keys of added entries
+        self.skipped = []        # (entry, reason)
+        self.renamed = []        # (old key, new key, own)
         self.warnings = []
+
+    def keep(self, entry):
+        self.entries.append(entry)
+        for k in entry.keys:
+            self.index.setdefault(k.lower(), entry)
+
+    def owner(self, key):
+        return self.index.get(key.lower()) or self.reserved.get(key.lower())
 
     # prompting
 
@@ -560,23 +606,29 @@ class Merger:
         return None
 
     def ask_duplicate(self, entry, match, n, total):
+        own = entry.origin == 'target'
+        this, that = ('later', 'earlier') if own else ('incoming', 'existing')
         same_key = entry.key.lower() == match.target.key.lower()
         what = 'Duplicate' if match.sure else 'Possible duplicate'
         print()
         print(yellow(f'[{what}{f" {n}/{total}" if total > 1 else ""}] ') + dim(', '.join(match.reasons)))
-        print(describe(entry, 'incoming', self.args.into))
-        print(describe(match.target, 'existing', self.args.into))
+        print(describe(entry, this, self.args.into))
+        print(describe(match.target, that, self.args.into))
         old, new = bold(match.target.key), bold(entry.key)
         if same_key:
-            options = {'y': 'yes, keep the existing entry (the key is the same already)',
-                       'i': 'yes, replace it with the incoming entry'}
+            options = {'y': f'yes, keep the {that} entry (the key is the same already)',
+                       'i': f'yes, keep the {this} entry instead'}
         else:
-            options = {'y': f'yes, keep the existing entry, key {old}, alias {new}',
-                       'r': f'yes, keep the existing entry, key {new}, alias {old}',
-                       'i': f'yes, replace it with the incoming entry, key {old}, alias {new}',
-                       'ir': f'yes, replace it with the incoming entry, key {new}, alias {old}'}
-        options['n'] = 'no, ' + ('look at the next candidate' if n < total else 'add it as a new entry')
-        options['s'] = "skip, don't add the incoming entry"
+            options = {'y': f'yes, keep the {that} entry, key {old}, alias {new}',
+                       'r': f'yes, keep the {that} entry, key {new}, alias {old}',
+                       'i': f'yes, keep the {this} entry instead, key {old}, alias {new}',
+                       'ir': f'yes, keep the {this} entry instead, key {new}, alias {old}'}
+        if n < total:
+            options['n'] = 'no, look at the next candidate'
+        else:
+            options['n'] = 'no, keep both' if own else 'no, add it as a new entry'
+        if not own:
+            options['s'] = "skip, don't add the incoming entry"
         options['v'] = 'view both entries in full'
         options['q'] = 'quit, saving what was merged so far'
         for k, v in options.items():
@@ -596,7 +648,14 @@ class Merger:
     # merging
 
     def merge(self, entry):
-        entry.info = Info(entry, self.input_strings)
+        """Find out whether entry is already among self.entries, and act on it.
+
+        entry comes from a --from file, or, with --self, from the --into file
+        itself, in which case self.entries are the entries above it.
+        """
+        own = entry.origin == 'target'
+        if entry.info is None:
+            entry.info = Info(entry, self.input_strings)
         matches = [m for m in (compare(entry, t) for t in self.entries) if m]
         matches.sort(key=lambda m: m.score, reverse=True)
 
@@ -612,10 +671,12 @@ class Merger:
                 # can't ask: only certain duplicates are decided without the user
                 if m.sure:
                     self.duplicate(entry, m.target, how='auto: ' + ', '.join(m.reasons))
-                elif self.args.uncertain == 'add':
+                elif self.args.uncertain == 'add' and not own:
                     continue
                 else:
                     self.skipped.append((entry, f'possibly a duplicate of {m.target.key}'))
+                    if own:
+                        self.keep(entry)  # it's in the file, and stays there
                 return
             if ans in ('y', 'r', 'i', 'ir'):
                 self.duplicate(entry, m.target, how='confirmed',
@@ -630,12 +691,16 @@ class Merger:
         """entry is the same work as target: keep one of them, with the other's keys as aliases."""
         old_key = target.key
         all_keys = target.keys + entry.keys
+        own = entry.origin == 'target'
+        if own:
+            self.removed.append(entry)
         if use_input_entry:
             target.replace_with(entry)
-            self.bring_strings(target)
+            if not own:
+                self.bring_strings(target)
         key = entry.key if use_input_key else old_key
-        owner = self.index.get(key.lower())
-        if owner is not None and owner is not target:
+        owner = self.owner(key)
+        if owner is not None and owner not in (target, entry):
             self.warnings.append(f"can't rename {old_key} to {key}: {owner.key} already uses that key")
             key = old_key
         if target.key != key:
@@ -646,8 +711,8 @@ class Merger:
         for k in all_keys:
             if k.lower() in have:
                 continue
-            owner = self.index.get(k.lower())
-            if owner is not None and owner is not target:
+            owner = self.owner(k)
+            if owner is not None and owner not in (target, entry):
                 self.warnings.append(f"can't add alias {k} to {target.key}: "
                                      f'{owner.key} already uses that key')
                 continue
@@ -658,38 +723,42 @@ class Merger:
             self.index[k.lower()] = target
         self.duplicates.append(Duplicate(entry.key, target, how, aliases,
                                          old_key if key.lower() != old_key.lower() else None,
-                                         use_input_entry))
+                                         use_input_entry, own))
 
     def add(self, entry):
+        """entry is not a duplicate: add it (or with --self, leave it where it is)."""
+        own = entry.origin == 'target'
+        this, that = ('later', 'earlier') if own else ('incoming', 'existing')
         if entry.key.lower() in self.index:
             other = self.index[entry.key.lower()]
             new = self.free_key(entry.key)
             print()
             print(yellow('[Key conflict] ') + f'{bold(entry.key)} is already used by a different entry:')
-            print(describe(entry, 'incoming', self.args.into))
-            print(describe(other, 'existing', self.args.into))
-            ans = self.ask(f'  New key for the incoming entry [{new}] > ')
-            while ans and ans.lower() in self.index:
+            print(describe(entry, this, self.args.into))
+            print(describe(other, that, self.args.into))
+            ans = self.ask(f'  New key for the {this} entry [{new}] > ')
+            while ans and self.owner(ans) not in (None, entry):
                 ans = self.ask(f'  {ans} is taken too. New key [{new}] > ')
             new = ans or new
-            self.renamed.append((entry.key, new))
+            self.renamed.append((entry.key, new, own))
             entry.rename(new)
-        clashes = [k for k in entry.aliases if k.lower() in self.index]
+        clashes = [k for k in entry.aliases if self.owner(k) not in (None, entry)]
         if clashes:
             self.warnings.append(f'{entry.key}: its aliases {", ".join(clashes)} '
                                  'are already used by other entries')
-        self.bring_strings(entry)
-        self.entries.append(entry)
-        self.added.append(entry)
-        for k in entry.keys:
-            self.index.setdefault(k.lower(), entry)
+        if not own:
+            self.bring_strings(entry)
+            self.added.append(entry)
+        self.keep(entry)
 
     def free_key(self, key):
+        def taken(k):
+            return self.owner(k) is not None
         for suffix in 'bcdefghijklmnopqrstuvwxyz':
-            if (key + suffix).lower() not in self.index:
+            if not taken(key + suffix):
                 return key + suffix
         n = 2
-        while f'{key}-{n}'.lower() in self.index:
+        while taken(f'{key}-{n}'):
             n += 1
         return f'{key}-{n}'
 
@@ -735,6 +804,20 @@ class Merger:
         nl = '\r\n' if '\r\n' in text else '\n'
         edits = [(e.span[0], e.span[1], e.raw) for e in self.entries
                  if e.origin == 'target' and e.modified]
+        for e in self.removed:
+            # the whole lines it is on, and the blank lines after it
+            start, end = e.span
+            line_start = text.rfind('\n', 0, start) + 1
+            if not text[line_start:start].strip():
+                start = line_start
+            end = re.compile(r'[ \t]*(?:\r?\n[ \t]*)*').match(text, end).end()
+            if end < len(text):
+                end = text.rfind('\n', 0, end) + 1
+                edits.append((start, end, ''))
+            else:
+                # last entry of the file: also drop the blank lines before it
+                start = len(text[:start].rstrip())
+                edits.append((start, end, nl if start else ''))
         strings_block = nl.join(s.raw for s in self.new_strings.values())
         if strings_block and target_strings:
             # next to the @strings already there
@@ -752,40 +835,61 @@ class Merger:
         return text
 
     def report(self, verbose):
-        if self.duplicates:
-            changed = [d for d in self.duplicates if d.aliases or d.renamed_from or d.replaced]
-            print(f'\n{bold("Already present")}: {len(self.duplicates)} entries, '
+        own_dups = [d for d in self.duplicates if d.own]
+        if own_dups:
+            print(f'\n{bold("Duplicates removed")} from {self.args.into}: {len(own_dups)} entries')
+            self.report_duplicates(own_dups, True)
+        own_renamed = [r for r in self.renamed if r[2]]
+        if own_renamed:
+            print(f'\n{bold("Renamed")} (the key was used by two different entries):')
+            for old, new, _ in own_renamed:
+                print(f'  {old} -> {new}')
+        own_skipped = [s for s in self.skipped if s[0].origin == 'target']
+        if own_skipped:
+            print(f'\n{bold("Left alone")}:')
+            for e, why in own_skipped:
+                print(f'  {e.key:<32} {why}')
+
+        dups = [d for d in self.duplicates if not d.own]
+        if dups:
+            changed = [d for d in dups if d.aliases or d.renamed_from or d.replaced]
+            print(f'\n{bold("Already present")}: {len(dups)} entries, '
                   f'{len(changed)} of them changed the existing entry')
-            for d in self.duplicates:
-                if d not in changed and not verbose:
-                    continue
-                changes = []
-                if d.replaced:
-                    changes.append('replaced by the incoming entry')
-                if d.renamed_from:
-                    changes.append(f'renamed {d.renamed_from} -> {d.key}')
-                if d.aliases:
-                    changes.append(f'alias {", ".join(d.aliases)}')
-                change = ', '.join(changes) if changes else 'nothing to do'
-                print(f'  {d.input_key:<32} {d.key}: {change}  {dim("(" + d.how + ")")}')
+            self.report_duplicates(dups, verbose)
         if self.added:
             print(f'\n{bold("Added")}: {len(self.added)} entries' +
                   (f', {len(self.new_strings)} @string definitions' if self.new_strings else ''))
             if verbose:
                 for e in self.added:
                     print(f'  {e.key:<32} {e.info.title_raw}')
-        if self.renamed:
+        renamed = [r for r in self.renamed if not r[2]]
+        if renamed:
             print(f'\n{bold("Added under a new key")} (because the key was taken):')
-            for old, new in self.renamed:
+            for old, new, _ in renamed:
                 print(f'  {old} -> {new}')
-        if self.skipped:
+        skipped = [s for s in self.skipped if s[0].origin != 'target']
+        if skipped:
             print(f'\n{bold("Not added")}:')
-            for e, why in self.skipped:
+            for e, why in skipped:
                 print(f'  {e.key:<32} {why}')
         if self.warnings:
             print(f'\n{bold("Warnings")}:')
             for w in self.warnings:
                 print(f'  {w}')
+
+    def report_duplicates(self, dups, verbose):
+        for d in dups:
+            changes = []
+            if d.replaced:
+                changes.append('replaced by the ' + ('later' if d.own else 'incoming') + ' entry')
+            if d.renamed_from:
+                changes.append(f'renamed {d.renamed_from} -> {d.key}')
+            if d.aliases:
+                changes.append(f'alias {", ".join(d.aliases)}')
+            if not changes and not verbose:
+                continue
+            change = ', '.join(changes) if changes else 'nothing to do'
+            print(f'  {d.input_key:<32} {d.key}: {change}  {dim("(" + d.how + ")")}')
 
 
 def write_atomic(path, text):
@@ -814,9 +918,12 @@ def main():
     parser.add_argument('--into', required=True, metavar='BIB',
                         help='the .bib file to enrich: new entries and aliases are written into it '
                              '(in place, unless -o is given)')
-    parser.add_argument('--from', dest='sources', action='append', required=True, metavar='BIB',
+    parser.add_argument('--from', dest='sources', action='append', default=[], metavar='BIB',
                         help='a .bib file to take entries from; it is only read, never modified. '
                              'Can be given more than once')
+    parser.add_argument('--self', dest='dedupe', action='store_true',
+                        help='first remove duplicates within the --into file itself '
+                             '(with --from, the merge happens after that)')
     parser.add_argument('-o', '--output', metavar='BIB',
                         help='write the result here instead of over the --into file')
     parser.add_argument('-n', '--dry-run', action='store_true', help="only report, don't write anything")
@@ -830,6 +937,8 @@ def main():
     parser.add_argument('-v', '--verbose', action='store_true', help='list every decision')
     args = parser.parse_args()
     args.interactive = not args.no_interactive and sys.stdin.isatty()
+    if not args.sources and not args.dedupe:
+        parser.error('nothing to do: give --from BIB to merge, and/or --self to deduplicate --into')
 
     for path in [args.into] + args.sources:
         if not os.path.isfile(path):
@@ -839,8 +948,14 @@ def main():
             parser.error(f'--from {path} is the same file as --into {args.into}')
 
     out = args.output or args.into
-    print(f'Merging entries from {", ".join(args.sources)} into {bold(out)}'
-          + (f' (based on {args.into})' if args.output else '')
+    sources = ', '.join(args.sources)
+    if args.dedupe and args.sources:
+        what = f'Removing duplicates within {bold(out)}, then merging entries from {sources} into it'
+    elif args.dedupe:
+        what = f'Removing duplicates within {bold(out)}'
+    else:
+        what = f'Merging entries from {sources} into {bold(out)}'
+    print(what + (f' (based on {args.into})' if args.output else '')
           + (' (dry run)' if args.dry_run else '') + '.')
 
     target_text = read(args.into)
@@ -853,16 +968,20 @@ def main():
         input_strings += strings
 
     merger = Merger(target_entries, target_strings, input_strings, args)
-    for e in merger.entries:
+    for e in target_entries:
         e.info = Info(e, merger.target_strings)
 
     quit_early = False
+    todo = (target_entries if args.dedupe else []) + input_entries
+    if not args.dedupe:
+        for e in target_entries:
+            merger.keep(e)
     try:
-        for n, entry in enumerate(input_entries):
+        for n, entry in enumerate(todo):
             merger.merge(entry)
     except Quit:
         quit_early = True
-        for entry in input_entries[n:]:
+        for entry in todo[n:]:
             merger.skipped.append((entry, 'not looked at (quit)'))
     except KeyboardInterrupt:
         sys.exit('\nAborted, nothing was written.')
@@ -875,7 +994,7 @@ def main():
         write_atomic(out, result)
         print(f'\nWrote {out}.' + (' (stopped early)' if quit_early else ''))
     else:
-        print(f'\nNothing to add, {out} is unchanged.')
+        print(f'\nNothing to do, {out} is unchanged.')
 
 
 if __name__ == '__main__':
