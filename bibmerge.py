@@ -2,13 +2,13 @@
 """
 Enrich one BibTeX file with the entries of another, without creating duplicates.
 
-    python3 bibmerge.py references.bib input.bib
+    python3 bibmerge.py --into references.bib --from other.bib
 
-Every entry of input.bib is compared against references.bib (DOI, title,
+Every entry of other.bib is compared against references.bib (DOI, title,
 authors, year, key). Entries that are certainly already there are dropped, and
 if their key differs it is recorded as an alias (biblatex `ids` field) so
-\\cite{input-key} keeps working. When it is unclear, you are asked. Everything
-else is appended to references.bib, copied verbatim.
+\\cite{other-key} keeps working. When it is unclear, you are asked. Everything
+else is appended to references.bib, copied verbatim. other.bib is only read.
 
 references.bib is edited as text: entries are only touched when they gain an
 alias, a new key or are replaced by the input version, everything else
@@ -195,9 +195,10 @@ class StringDef:
 
 
 class Entry:
-    def __init__(self, raw, origin, span=None, prefix=''):
+    def __init__(self, raw, origin, path, span=None, prefix=''):
         self.raw = raw
-        self.origin = origin          # 'target' or 'input'
+        self.origin = origin          # 'target' (the --into file) or 'input' (a --from file)
+        self.path = path
         self.span = span              # where it sits in its source file
         self.prefix = prefix          # comment lines just above it, kept with it
         self.modified = False
@@ -316,7 +317,7 @@ def parse_bib(text, origin, path):
             if kind == 'string':
                 strings.append(StringDef(raw, (at, end)))
             elif kind not in ('comment', 'preamble'):
-                entries.append(Entry(raw, origin, (at, end), preceding_comments(text, at)))
+                entries.append(Entry(raw, origin, path, (at, end), preceding_comments(text, at)))
         except BibSyntaxError as e:
             line = text.count('\n', 0, at) + 1
             sys.exit(f'{path}:{line}: {e}')
@@ -495,10 +496,14 @@ def short_authors(info, n=4):
     return '; '.join(people)
 
 
-def describe(entry, label):
+def describe(entry, label, into):
     i = entry.info
     alias = f'  {dim("aliases: " + ", ".join(entry.aliases))}' if entry.aliases else ''
-    lines = [f'  {bold(f"{label:<10}")} @{entry.type}{{{bold(entry.key)}}}{alias}',
+    if label == 'existing' and entry.origin == 'input':
+        where = f'in {into}, added from {entry.path} during this run'
+    else:
+        where = f'in {entry.path}'
+    lines = [f'  {bold(f"{label:<10}")} @{entry.type}{{{bold(entry.key)}}}{alias}  {dim("(" + where + ")")}',
              f'             {i.title_raw or "(no title)"}',
              f'             {short_authors(i)}',
              f'             {i.year_raw or "(no year)"}' + (f' · {i.venue}' if i.venue else '')]
@@ -559,19 +564,19 @@ class Merger:
         what = 'Duplicate' if match.sure else 'Possible duplicate'
         print()
         print(yellow(f'[{what}{f" {n}/{total}" if total > 1 else ""}] ') + dim(', '.join(match.reasons)))
-        print(describe(entry, 'input'))
-        print(describe(match.target, 'existing'))
+        print(describe(entry, 'incoming', self.args.into))
+        print(describe(match.target, 'existing', self.args.into))
         old, new = bold(match.target.key), bold(entry.key)
         if same_key:
             options = {'y': 'yes, keep the existing entry (the key is the same already)',
-                       'i': 'yes, replace it with the input entry'}
+                       'i': 'yes, replace it with the incoming entry'}
         else:
             options = {'y': f'yes, keep the existing entry, key {old}, alias {new}',
                        'r': f'yes, keep the existing entry, key {new}, alias {old}',
-                       'i': f'yes, replace it with the input entry, key {old}, alias {new}',
-                       'ir': f'yes, replace it with the input entry, key {new}, alias {old}'}
+                       'i': f'yes, replace it with the incoming entry, key {old}, alias {new}',
+                       'ir': f'yes, replace it with the incoming entry, key {new}, alias {old}'}
         options['n'] = 'no, ' + ('look at the next candidate' if n < total else 'add it as a new entry')
-        options['s'] = "skip, don't add the input entry"
+        options['s'] = "skip, don't add the incoming entry"
         options['v'] = 'view both entries in full'
         options['q'] = 'quit, saving what was merged so far'
         for k, v in options.items():
@@ -661,9 +666,9 @@ class Merger:
             new = self.free_key(entry.key)
             print()
             print(yellow('[Key conflict] ') + f'{bold(entry.key)} is already used by a different entry:')
-            print(describe(entry, 'input'))
-            print(describe(other, 'existing'))
-            ans = self.ask(f'  New key for the input entry [{new}] > ')
+            print(describe(entry, 'incoming', self.args.into))
+            print(describe(other, 'existing', self.args.into))
+            ans = self.ask(f'  New key for the incoming entry [{new}] > ')
             while ans and ans.lower() in self.index:
                 ans = self.ask(f'  {ans} is taken too. New key [{new}] > ')
             new = ans or new
@@ -689,7 +694,7 @@ class Merger:
         return f'{key}-{n}'
 
     def bring_strings(self, entry):
-        """Make sure every @string macro the entry uses means the same in the target."""
+        """Make sure every @string macro the entry uses means the same in the --into file."""
         for field in list(entry.field_list):
             for idx, (kind, name, _, _) in enumerate(field.parts):
                 if kind == 'macro' and name.lower() not in MONTHS:
@@ -707,8 +712,8 @@ class Merger:
                 # same macro name, different meaning: spell it out
                 field = next(f for f in entry.field_list if f.name == field_name)
                 entry.inline_macro(field, idx, source.value)
-                self.warnings.append(f'{entry.key}: @string {name} means something else in the '
-                                     f'target, so its value was written out in full')
+                self.warnings.append(f'{entry.key}: @string {name} means something else in '
+                                     f'{self.args.into}, so its value was written out in full')
             return
         self.take_string(name)
 
@@ -756,7 +761,7 @@ class Merger:
                     continue
                 changes = []
                 if d.replaced:
-                    changes.append('replaced by the input entry')
+                    changes.append('replaced by the incoming entry')
                 if d.renamed_from:
                     changes.append(f'renamed {d.renamed_from} -> {d.key}')
                 if d.aliases:
@@ -804,13 +809,19 @@ def read(path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Enrich a BibTeX file with the entries of another one, without creating duplicates.')
-    parser.add_argument('target', help='the .bib file to enrich (edited in place unless -o is given)')
-    parser.add_argument('input', nargs='+', help='.bib file(s) to take new entries from')
-    parser.add_argument('-o', '--output', help='write the result here instead of over target')
+        description='Enrich a BibTeX file with the entries of other ones, without creating duplicates.',
+        epilog='example: %(prog)s --into references.bib --from chapters/paper/references.bib')
+    parser.add_argument('--into', required=True, metavar='BIB',
+                        help='the .bib file to enrich: new entries and aliases are written into it '
+                             '(in place, unless -o is given)')
+    parser.add_argument('--from', dest='sources', action='append', required=True, metavar='BIB',
+                        help='a .bib file to take entries from; it is only read, never modified. '
+                             'Can be given more than once')
+    parser.add_argument('-o', '--output', metavar='BIB',
+                        help='write the result here instead of over the --into file')
     parser.add_argument('-n', '--dry-run', action='store_true', help="only report, don't write anything")
     parser.add_argument('--confirm', action='store_true',
-                        help='also ask about certain duplicates (to choose which key to keep)')
+                        help='also ask about certain duplicates (to choose which key or entry to keep)')
     parser.add_argument('--no-interactive', action='store_true', help='never ask anything')
     parser.add_argument('--uncertain', choices=('skip', 'add'), default='skip',
                         help='what to do with possible duplicates when we cannot ask (default: skip)')
@@ -820,11 +831,23 @@ def main():
     args = parser.parse_args()
     args.interactive = not args.no_interactive and sys.stdin.isatty()
 
-    target_text = read(args.target)
-    target_entries, target_strings = parse_bib(target_text, 'target', args.target)
+    for path in [args.into] + args.sources:
+        if not os.path.isfile(path):
+            parser.error(f'{path}: no such file')
+    for path in args.sources:
+        if os.path.samefile(path, args.into):
+            parser.error(f'--from {path} is the same file as --into {args.into}')
+
+    out = args.output or args.into
+    print(f'Merging entries from {", ".join(args.sources)} into {bold(out)}'
+          + (f' (based on {args.into})' if args.output else '')
+          + (' (dry run)' if args.dry_run else '') + '.')
+
+    target_text = read(args.into)
+    target_entries, target_strings = parse_bib(target_text, 'target', args.into)
     input_strings = []
     input_entries = []
-    for path in args.input:
+    for path in args.sources:
         entries, strings = parse_bib(read(path), 'input', path)
         input_entries += entries
         input_strings += strings
@@ -846,7 +869,6 @@ def main():
 
     merger.report(args.verbose)
     result = merger.render(target_text, target_strings)
-    out = args.output or args.target
     if args.dry_run:
         print(f'\nDry run: {out} was not written.')
     elif result != target_text or args.output:

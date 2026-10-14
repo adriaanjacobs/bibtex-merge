@@ -3,16 +3,16 @@
 Enrich a BibTeX file you're happy with by pulling in the new references from another one, without creating duplicates.
 
 ```bash
-python3 bibmerge.py references.bib input.bib
+./bibmerge.py --into references.bib --from other.bib
 ```
 
-No dependencies beyond Python 3.
+`--into` is the file that gets enriched (and modified, unless you pass `-o`). `--from` is only read, and can be given more than once. No dependencies beyond Python 3.
 
 ## What it does
 
-Every entry of `input.bib` is compared against `references.bib` (and against the entries added so far, so duplicates *within* `input.bib` are caught as well):
+Every entry of `other.bib` is compared against `references.bib` (and against the entries added so far, so duplicates *within* `other.bib` are caught as well):
 
-- **Certainly a duplicate**: same DOI (also found in `doi.org` URLs), or the exact same title with matching year and authors. It is dropped. If its key differs, the input key is added to the existing entry as an alias, so `\cite{input-key}` keeps working:
+- **Certainly a duplicate**: same DOI (also found in `doi.org` URLs), or the exact same title with matching year and authors. It is dropped. If its key differs, the incoming key is added to the existing entry as an alias, so `\cite{other-key}` keeps working:
   ```bibtex
   @inproceedings{abadi2005CFI,
   ids = {abadi2005control},
@@ -21,20 +21,20 @@ Every entry of `input.bib` is compared against `references.bib` (and against the
 - **Possibly a duplicate**: similar title, same authors with a looser title match, or the same key. You're asked:
   ```
   [Possible duplicate] title 91% similar, 100% of authors shared, same year
-    input      @article{ann2019widgets}
+    incoming   @article{ann2019widgets}  (in other.bib)
                Fuzzy widgets for everybody
-    existing   @article{lee2019}
+    existing   @article{lee2019}  (in references.bib)
                Fuzzy Widgets for Everyone
       [y] yes, keep the existing entry, key lee2019, alias ann2019widgets
       [r] yes, keep the existing entry, key ann2019widgets, alias lee2019
-      [i] yes, replace it with the input entry, key lee2019, alias ann2019widgets
-      [ir] yes, replace it with the input entry, key ann2019widgets, alias lee2019
+      [i] yes, replace it with the incoming entry, key lee2019, alias ann2019widgets
+      [ir] yes, replace it with the incoming entry, key ann2019widgets, alias lee2019
       [n] no, add it as a new entry
-      [s] skip, don't add the input entry
+      [s] skip, don't add the incoming entry
       [v] view both entries in full
       [q] quit, saving what was merged so far
   ```
-  So you pick which version of the entry to keep (`i` takes the input's), and which key to keep (`r` takes the input's); the other key becomes an alias. The input entry takes the existing entry's place in the file.
+  So you pick which version of the entry to keep (`i` takes the incoming one), and which key to keep (`r` takes the incoming one); the other key becomes an alias. The incoming entry takes the existing entry's place in the file.
 - **New**: appended to `references.bib`, copied verbatim (including `%` comment lines directly above it). If its key is already taken by a different entry, you're asked for a new one.
 
 `@string` macros the new entries use are copied along. If `references.bib` already defines a macro with the same name but a different meaning, that value is written out in full in the entry instead.
@@ -49,9 +49,9 @@ Aliases go in the `ids` field, which **biblatex** (with biber) understands. Clas
 
 | Flag | Meaning |
 | --- | --- |
-| `target` | The `.bib` file to enrich. Edited in place unless `-o` is given. |
-| `input...` | One or more `.bib` files to take new entries from. |
-| `-o`, `--output` | Write the result here instead of over `target`. |
+| `--into BIB` | The `.bib` file to enrich. Edited in place unless `-o` is given. |
+| `--from BIB` | A `.bib` file to take new entries from. Only read. Repeat it to merge several files. |
+| `-o`, `--output` | Write the result here instead of over the `--into` file. |
 | `-n`, `--dry-run` | Only report what would happen. |
 | `--confirm` | Also ask about certain duplicates, e.g. to choose which key or entry to keep. |
 | `--no-interactive` | Never ask. Also the case when stdin is not a terminal. |
