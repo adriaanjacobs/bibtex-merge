@@ -11,7 +11,8 @@ if their key differs it is recorded as an alias (biblatex `ids` field) so
 else is appended to references.bib, copied verbatim.
 
 references.bib is edited as text: entries are only touched when they gain an
-alias or a new key, everything else (formatting, comments, order) stays as is.
+alias, a new key or are replaced by the input version, everything else
+(formatting, comments, order) stays as is.
 """
 
 import argparse
@@ -236,6 +237,11 @@ class Entry:
 
     def rename(self, key):
         self._replace(*self.key_span, key)
+
+    def replace_with(self, other):
+        """Take over the contents of another entry, staying where this one is."""
+        self._replace(0, len(self.raw), other.raw)
+        self.info = other.info
 
     def add_aliases(self, aliases, field='ids'):
         if not aliases:
@@ -501,6 +507,17 @@ def describe(entry, label):
     return '\n'.join(lines)
 
 
+class Duplicate:
+    def __init__(self, input_key, target, how, aliases, renamed_from, replaced):
+        self.input_key = input_key
+        self.target = target
+        self.key = target.key             # as it was right after this decision
+        self.how = how
+        self.aliases = aliases            # keys added as alias to target
+        self.renamed_from = renamed_from  # target's key before, if it changed
+        self.replaced = replaced          # target now holds the input entry's contents
+
+
 class Merger:
     def __init__(self, target_entries, target_strings, input_strings, args):
         self.args = args
@@ -514,7 +531,7 @@ class Merger:
                 self.index.setdefault(k.lower(), e)
         self.interactive = args.interactive
         self.added = []
-        self.duplicates = []     # (input key, entry, how)
+        self.duplicates = []     # [Duplicate]
         self.skipped = []        # (input entry, reason)
         self.renamed = []        # (old, new) keys of added entries
         self.warnings = []
@@ -544,11 +561,15 @@ class Merger:
         print(yellow(f'[{what}{f" {n}/{total}" if total > 1 else ""}] ') + dim(', '.join(match.reasons)))
         print(describe(entry, 'input'))
         print(describe(match.target, 'existing'))
+        old, new = bold(match.target.key), bold(entry.key)
         if same_key:
-            options = {'y': 'yes, the same work (key is the same already)'}
+            options = {'y': 'yes, keep the existing entry (the key is the same already)',
+                       'i': 'yes, replace it with the input entry'}
         else:
-            options = {'y': f'yes, keep {bold(match.target.key)} and add {bold(entry.key)} as alias',
-                       'r': f'yes, use {bold(entry.key)} as key and add {bold(match.target.key)} as alias'}
+            options = {'y': f'yes, keep the existing entry, key {old}, alias {new}',
+                       'r': f'yes, keep the existing entry, key {new}, alias {old}',
+                       'i': f'yes, replace it with the input entry, key {old}, alias {new}',
+                       'ir': f'yes, replace it with the input entry, key {new}, alias {old}'}
         options['n'] = 'no, ' + ('look at the next candidate' if n < total else 'add it as a new entry')
         options['s'] = "skip, don't add the input entry"
         options['v'] = 'view both entries in full'
@@ -556,10 +577,10 @@ class Merger:
         for k, v in options.items():
             print(f'    [{k}] {v}')
         while True:
-            ans = self.ask('  > ', set(options))
+            ans = self.ask('  > ', set(options) | ({'ri'} if 'ir' in options else set()))
             if ans is None:
                 return None
-            ans = ans.lower()
+            ans = ''.join(sorted(ans.lower()))  # 'ri' -> 'ir'
             if ans == 'v':
                 print('\n' + entry.prefix + entry.raw + '\n\n' + match.target.raw + '\n')
                 continue
@@ -576,7 +597,7 @@ class Merger:
 
         sure = [m for m in matches if m.sure]
         if sure and not self.args.confirm:
-            self.duplicate(entry, sure[0].target, rename=False, how='auto: ' + ', '.join(sure[0].reasons))
+            self.duplicate(entry, sure[0].target, how='auto: ' + ', '.join(sure[0].reasons))
             return
 
         candidates = matches[:MAX_CANDIDATES]
@@ -585,28 +606,39 @@ class Merger:
             if ans is None:
                 # can't ask: only certain duplicates are decided without the user
                 if m.sure:
-                    self.duplicate(entry, m.target, rename=False, how='auto: ' + ', '.join(m.reasons))
+                    self.duplicate(entry, m.target, how='auto: ' + ', '.join(m.reasons))
                 elif self.args.uncertain == 'add':
                     continue
                 else:
                     self.skipped.append((entry, f'possibly a duplicate of {m.target.key}'))
                 return
-            if ans in ('y', 'r'):
-                self.duplicate(entry, m.target, rename=ans == 'r', how='confirmed')
+            if ans in ('y', 'r', 'i', 'ir'):
+                self.duplicate(entry, m.target, how='confirmed',
+                               use_input_key='r' in ans, use_input_entry='i' in ans)
                 return
             if ans == 's':
                 self.skipped.append((entry, 'skipped by you'))
                 return
         self.add(entry)
 
-    def duplicate(self, entry, target, rename, how):
+    def duplicate(self, entry, target, how, use_input_key=False, use_input_entry=False):
+        """entry is the same work as target: keep one of them, with the other's keys as aliases."""
         old_key = target.key
-        if rename and entry.key.lower() != target.key.lower():
-            target.rename(entry.key)
-            self.index[entry.key.lower()] = target
+        all_keys = target.keys + entry.keys
+        if use_input_entry:
+            target.replace_with(entry)
+            self.bring_strings(target)
+        key = entry.key if use_input_key else old_key
+        owner = self.index.get(key.lower())
+        if owner is not None and owner is not target:
+            self.warnings.append(f"can't rename {old_key} to {key}: {owner.key} already uses that key")
+            key = old_key
+        if target.key != key:
+            target.rename(key)
+        self.index[key.lower()] = target
         have = {k.lower() for k in target.keys}
         aliases = []
-        for k in ([old_key] if rename else []) + entry.keys:
+        for k in all_keys:
             if k.lower() in have:
                 continue
             owner = self.index.get(k.lower())
@@ -619,7 +651,9 @@ class Merger:
         target.add_aliases(aliases, self.args.alias_field)
         for k in aliases:
             self.index[k.lower()] = target
-        self.duplicates.append((entry.key, target, how, aliases, old_key if rename else None))
+        self.duplicates.append(Duplicate(entry.key, target, how, aliases,
+                                         old_key if key.lower() != old_key.lower() else None,
+                                         use_input_entry))
 
     def add(self, entry):
         if entry.key.lower() in self.index:
@@ -714,21 +748,21 @@ class Merger:
 
     def report(self, verbose):
         if self.duplicates:
-            aliased = [d for d in self.duplicates if d[3] or d[4]]
+            changed = [d for d in self.duplicates if d.aliases or d.renamed_from or d.replaced]
             print(f'\n{bold("Already present")}: {len(self.duplicates)} entries, '
-                  f'{len(aliased)} of them under a different key')
-            for key, target, how, aliases, renamed in self.duplicates:
-                if not (aliases or renamed or verbose):
+                  f'{len(changed)} of them changed the existing entry')
+            for d in self.duplicates:
+                if d not in changed and not verbose:
                     continue
-                if renamed:
-                    change = f'renamed {renamed} -> {target.key}'
-                    if aliases:
-                        change += f', alias {", ".join(aliases)}'
-                elif aliases:
-                    change = f'alias {", ".join(aliases)} added to {target.key}'
-                else:
-                    change = f'same as {target.key}'
-                print(f'  {key:<32} {change}  {dim("(" + how + ")")}')
+                changes = []
+                if d.replaced:
+                    changes.append('replaced by the input entry')
+                if d.renamed_from:
+                    changes.append(f'renamed {d.renamed_from} -> {d.key}')
+                if d.aliases:
+                    changes.append(f'alias {", ".join(d.aliases)}')
+                change = ', '.join(changes) if changes else 'nothing to do'
+                print(f'  {d.input_key:<32} {d.key}: {change}  {dim("(" + d.how + ")")}')
         if self.added:
             print(f'\n{bold("Added")}: {len(self.added)} entries' +
                   (f', {len(self.new_strings)} @string definitions' if self.new_strings else ''))
